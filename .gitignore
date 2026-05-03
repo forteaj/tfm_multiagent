@@ -1,0 +1,42 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# PyCharm
+.idea/
+
+# Environment variables
+.env
+
+# Test/cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and outputs
+runs/*.jsonl
+outputs/
+logs/
+
+# Temporary files
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large/local model files
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
