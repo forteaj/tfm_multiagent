@@ -5,7 +5,7 @@ import re
 
 def run_tests(task_dir: Path) -> dict:
     result = subprocess.run(
-        ["pytest", "-q"],
+        ["pytest", "-q", "--ignore=original"],
         cwd=task_dir,
         capture_output=True,
         text=True,
