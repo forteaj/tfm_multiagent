@@ -1,0 +1,1 @@
+Functions in bug1.py is returning an incorrect result. Fix the implementation so that all tests in testBug1.py pass.
