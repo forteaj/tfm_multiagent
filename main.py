@@ -136,10 +136,11 @@ def main() -> None:
     except Exception as exc:
         print("\nCould not generate automatic tests.")
         print(exc)
+        print("\nContinuing with manual tests only.")
 
-        run_log["error"] = f"test_generation_failed: {exc}"
-        append_run_log(LOG_FILE, run_log)
-        return
+        generated_test_code = ""
+        run_log["generated_tests_valid"] = False
+        run_log["error"] = f"test_generation_failed_but_continued: {exc}"
 
     print("Running tests before fix...\n")
     before = run_tests(task_dir)

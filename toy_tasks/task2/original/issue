@@ -1,1 +1,1 @@
-Functions in bug1.py is returning an incorrect result. Fix the implementation so that all tests in testBug1.py pass.
+The reverse_items function should return a reversed copy of the input list without modifying the original list.

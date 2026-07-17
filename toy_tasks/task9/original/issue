@@ -1,0 +1,1 @@
+The average function should return the arithmetic mean of a list of numbers. If the list is empty, it should return None instead of raising an exception.

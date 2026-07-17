@@ -1,14 +1,17 @@
-from bug1 import *
+from bug1 import reverse_items
 
 
-def test_add():
-    assert add(2, 3) == 5
+def test_reverse_items_returns_reversed_list():
+    items = [1, 2, 3]
 
-def test_substract():
-    assert substract(6,3) == 3
+    result = reverse_items(items)
 
-def test_multiply():
-    assert multiply(8, 2) == 16
+    assert result == [3, 2, 1]
 
-def test_divide():
-    assert divide(8, 2) == 4
+
+def test_reverse_items_does_not_modify_original_list():
+    items = [1, 2, 3]
+
+    reverse_items(items)
+
+    assert items == [1, 2, 3]
