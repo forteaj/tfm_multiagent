@@ -1,0 +1,1 @@
+The add_item function should return a new list when no list is provided. Calls without an explicit list should not share state between them.

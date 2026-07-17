@@ -1,0 +1,1 @@
+The remove_even_numbers function should remove all even numbers from the input list. The current implementation skips some even numbers when they appear consecutively.

@@ -1,0 +1,1 @@
+The duplicate_matrix function should return an independent copy of a nested list. Modifying the copied matrix should not affect the original matrix.

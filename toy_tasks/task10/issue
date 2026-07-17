@@ -1,0 +1,1 @@
+The is_admin function should return True when the role string has the value "admin". The current implementation incorrectly uses identity comparison instead of value comparison.
