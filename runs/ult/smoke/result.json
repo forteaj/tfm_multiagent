@@ -1,0 +1,17 @@
+{
+  "task_id": "10",
+  "function_name": "is_degree_in_degree_range",
+  "model_id": "google/gemma-4-e4b",
+  "generation_time_seconds": 23.7351,
+  "syntax_valid": true,
+  "format_valid": true,
+  "format_errors": [],
+  "pytest_exit_code": 0,
+  "test_passed": true,
+  "timed_out": false,
+  "execution_time_seconds": 0.7542,
+  "stdout": ".                                                                        [100%]\n=============================== tests coverage ================================\n_______________ coverage: platform win32, python 3.11.4-final-0 _______________\n\nName          Stmts   Miss Branch BrPart  Cover   Missing\n---------------------------------------------------------\nsolution.py      17      5     12      3    59%   6, 18-21\n---------------------------------------------------------\nTOTAL            17      5     12      3    59%\nCoverage JSON written to file coverage.json\n1 passed in 0.03s\n",
+  "stderr": "",
+  "line_coverage": 70.59,
+  "branch_coverage": 41.67
+}
