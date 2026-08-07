@@ -90,6 +90,10 @@ PREVIOUSLY GENERATED TESTS:
         ],
         temperature=0,
         max_tokens=4096,
+        #for qwen, remove for gemma
+
+
+
     )
 
     choice = response.choices[0]
