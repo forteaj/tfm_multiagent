@@ -3,7 +3,11 @@ langchain
 langchain-openai
 openai
 python-dotenv
-pytest
+pytest>=9.0
+pytest-cov
+coverage
+radon
+cosmic-ray==8.4.6
 rich
 pydantic
 typing-extensions
