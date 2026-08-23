@@ -1,5 +1,5 @@
 """Reviewer agent and deterministic candidate evaluation node."""
-
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,8 @@ REVIEW REQUIREMENTS:
 - Return only the corrected atomic test.
 """.strip()
 
+    review_start = time.perf_counter()
+
     response = client.chat.completions.create(
         model=state["model_id"],
         messages=[
@@ -84,6 +86,11 @@ REVIEW REQUIREMENTS:
         ],
         temperature=0,
         max_tokens=4096,
+    )
+
+    review_time = round(
+        time.perf_counter() - review_start,
+        4,
     )
 
     choice = response.choices[0]
@@ -105,11 +112,13 @@ REVIEW REQUIREMENTS:
     return {
         "raw_review_response": raw_response,
         "reviewed_test": reviewed_test,
-        "review_feedback": "Candidate reviewed by the reviewer agent.",
+        "review_feedback": (
+            "Candidate reviewed by the reviewer agent."
+        ),
+        "review_time_seconds": review_time,
         "review_finish_reason": choice.finish_reason,
         "review_usage": usage,
     }
-
 
 def get_accepted_test_names(
     accepted_tests: list[str],
@@ -152,7 +161,6 @@ def build_evaluation_feedback(
         return output[:4000]
 
     return "Candidate accepted."
-
 
 def evaluator_node(state: dict[str, Any]) -> dict[str, Any]:
     """Evaluate the reviewed candidate using the existing ULT evaluator."""
@@ -232,6 +240,15 @@ def evaluator_node(state: dict[str, Any]) -> dict[str, Any]:
             "test_passed"
         ]
 
+    candidate_execution_time = (
+        candidate_execution["execution_time_seconds"]
+        or 0.0
+    )
+
+    # Additional execution performed only when a candidate is rejected
+    # and a previously accepted suite exists.
+    fallback_suite_execution_time = 0.0
+
     if candidate_accepted:
         cumulative_execution = candidate_execution
 
@@ -254,6 +271,11 @@ def evaluator_node(state: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
+        fallback_suite_execution_time = (
+            cumulative_execution["execution_time_seconds"]
+            or 0.0
+        )
+
     else:
         # Keep a syntactically valid file even if no test was accepted.
         empty_suite = build_test_suite(
@@ -267,6 +289,12 @@ def evaluator_node(state: dict[str, Any]) -> dict[str, Any]:
         )
 
         cumulative_execution = empty_execution_result()
+
+    round_execution_time = round(
+        candidate_execution_time
+        + fallback_suite_execution_time,
+        4,
+    )
 
     line_gain = coverage_gain(
         current=cumulative_execution["line_coverage"],
@@ -301,8 +329,15 @@ def evaluator_node(state: dict[str, Any]) -> dict[str, Any]:
         f"BCov={cumulative_execution['branch_coverage']}"
     )
 
+    print(
+        "Execution time: "
+        f"candidate={candidate_execution_time:.4f}s | "
+        f"fallback={fallback_suite_execution_time:.4f}s | "
+        f"total={round_execution_time:.4f}s"
+    )
+
     return {
-        # Store the fence-free candidate.
+        # Final candidate evaluated by pytest.
         "reviewed_test": candidate,
 
         # Acceptance and validation.
@@ -319,14 +354,23 @@ def evaluator_node(state: dict[str, Any]) -> dict[str, Any]:
         ],
         "test_passed": candidate_execution["test_passed"],
         "timed_out": candidate_execution["timed_out"],
-        "execution_time_seconds": candidate_execution[
-            "execution_time_seconds"
-        ],
+        "candidate_execution_time_seconds": round(
+            candidate_execution_time,
+            4,
+        ),
+        "fallback_suite_execution_time_seconds": round(
+            fallback_suite_execution_time,
+            4,
+        ),
+
+        # Total execution time of this graph round.
+        "execution_time_seconds": round_execution_time,
+
         "execution_feedback": feedback,
         "candidate_stdout": candidate_execution["stdout"],
         "candidate_stderr": candidate_execution["stderr"],
 
-        # Accumulated-suite coverage.
+        # Accumulated-suite result.
         "suite_passed": cumulative_execution["test_passed"],
         "line_coverage": cumulative_execution[
             "line_coverage"
