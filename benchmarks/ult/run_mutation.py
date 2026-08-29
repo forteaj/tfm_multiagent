@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cosmic-ray-command", default=None)
     parser.add_argument("--keep-workdirs", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--final-only",action="store_true",help="Run mutation testing only on the final accumulated suite.",)
     return parser.parse_args()
 
 
@@ -41,6 +42,7 @@ def main() -> None:
         cosmic_ray_command=args.cosmic_ray_command,
         keep_workdirs=args.keep_workdirs,
         resume=args.resume,
+        final_only=args.final_only,
     )
     print(f"Mutation results: {results_path}")
     print(f"Mutant catalog: {catalog_path}")

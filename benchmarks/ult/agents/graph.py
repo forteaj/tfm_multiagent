@@ -1,30 +1,31 @@
 from openai import OpenAI
-from typing import TypedDict, List, Dict, Literal
+from typing import Any, TypedDict, List, Dict, Literal
 from langgraph.graph import StateGraph, START, END
 import json
 import time
-from benchmarks.ult.agents.reviewer import (evaluator_node,reviewer_node,)
+from benchmarks.ult.agents.reviewer import (
+    evaluator_node,
+    reviewer_node,
+)
+from benchmarks.ult.evaluator import remove_markdown_fences
 from pathlib import Path
+import os
+from benchmarks.ult.loader import ULTTask, load_ult
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-OUTPUT_DIR = (
+DATASET_PATH = (
     PROJECT_ROOT
-    / "runs"
-    / "ult"
-    / "multiagent"
-    / "smoke"
-    / "is_even"
+    / "external"
+    / "UnLeakedTestBench"
+    / "datasets"
+    / "ULT_Lite.jsonl"
 )
-
 
 client = OpenAI(
     base_url="http://localhost:1234/v1",
     api_key="lm-studio",
 )
-
-model_id = client.models.list().data[0].id
-
 
 class AgentState(TypedDict):
     model_id: str
@@ -32,6 +33,11 @@ class AgentState(TypedDict):
 
     function_name: str
     solution_code: str
+    description: str
+    cyclomatic_complexity: int | None
+    dataset_path: str
+
+
     output_dir: str
     timeout_seconds: int
 
@@ -39,6 +45,7 @@ class AgentState(TypedDict):
     max_rounds: int
 
     generated_test: str
+    candidate_test: str
     generation_time_seconds: float
     generator_finish_reason: str | None
     generator_usage: Dict | None
@@ -47,6 +54,11 @@ class AgentState(TypedDict):
     review_feedback: str
     review_finish_reason: str | None
     review_usage: Dict | None
+    reviewer_called: bool
+    repair_changed: bool
+    repair_duplicate: bool
+    generator_evaluation: Dict | None
+    repair_evaluation: Dict | None
 
     accepted: bool
     accepted_tests: List[str]
@@ -79,6 +91,27 @@ class AgentState(TypedDict):
 
     rounds: List[Dict]
 
+
+def format_previous_attempts(
+    rounds: List[Dict],
+) -> str:
+    """Reproduce the baseline history using only generator proposals."""
+
+    if not rounds:
+        return "No tests have been generated yet."
+
+    attempted_tests = [
+        remove_markdown_fences(
+            str(round_result.get("generator_test") or "")
+        )
+        for round_result in rounds
+    ]
+
+    return "\n\n".join(
+        test for test in attempted_tests if test
+    )
+
+
 def generator_node(state: AgentState) -> dict:
     """Generate one test candidate and record its metadata."""
 
@@ -86,37 +119,43 @@ def generator_node(state: AgentState) -> dict:
         f"Generating test for round {state['counter']}"
     )
 
-    previous_tests = (
-        "\n\n".join(state["accepted_tests"])
-        or "No tests have been accepted yet."
+    previous_tests = format_previous_attempts(
+        state["rounds"]
     )
 
     prompt = f"""
-Generate one pytest test for the following Python function.
-
-FUNCTION NAME:
-{state["function_name"]}
-
-SOURCE CODE:
-{state["solution_code"]}
-
-PREVIOUSLY ACCEPTED TESTS:
-{previous_tests}
+You are generating test case number {state["counter"]} for a Python function.
 
 OUTPUT FORMAT:
 - Return only valid Python code.
 - Include exactly one import statement.
 - Include exactly one test function whose name starts with test_.
 - Include exactly one assert statement.
-- Test exactly one concrete input case.
+- Test exactly one input case.
 - Use a test function name different from all previous tests.
-- Do not include comments, explanations, helpers, classes
-  or parametrization.
-- Do not return the complete accumulated suite.
-- Do not use Markdown fences.
+- Do not include comments, explanations, helpers, classes or parametrization.
 
-The import must be exactly:
-from solution import {state["function_name"]}
+TEST REQUIREMENTS:
+- Import the function exactly as follows:
+  from solution import {state["function_name"]}
+- Generate a case that is meaningfully different from previous tests.
+- Prefer an uncovered boundary, branch, exceptional case or input category.
+- Use a concrete expected value.
+- Do not reproduce or modify the implementation.
+- Do not access external resources.
+- The test must be deterministic and executable with pytest.
+
+FUNCTION NAME:
+{state["function_name"]}
+
+DESCRIPTION:
+{state["description"]}
+
+SOURCE CODE:
+{state["solution_code"]}
+
+PREVIOUSLY GENERATED TESTS:
+{previous_tests}
 """.strip()
 
     generation_start = time.perf_counter()
@@ -135,7 +174,7 @@ from solution import {state["function_name"]}
                 "content": prompt,
             },
         ],
-        temperature=0.2,
+        temperature=0,
         max_tokens=4096,
     )
 
@@ -160,6 +199,7 @@ from solution import {state["function_name"]}
 
     return {
         "generated_test": raw_response.strip(),
+        "candidate_test": raw_response.strip(),
         "generation_time_seconds": generation_time,
         "generator_finish_reason": choice.finish_reason,
         "generator_usage": usage,
@@ -170,6 +210,11 @@ from solution import {state["function_name"]}
         "review_time_seconds": 0.0,
         "review_finish_reason": None,
         "review_usage": None,
+        "reviewer_called": False,
+        "repair_changed": False,
+        "repair_duplicate": False,
+        "generator_evaluation": None,
+        "repair_evaluation": None,
 
         "accepted": False,
     }
@@ -179,7 +224,7 @@ def suite_node(state: AgentState) -> dict:
 
     updated_suite = [
         *state["accepted_tests"],
-        state["reviewed_test"],
+        state["candidate_test"],
     ]
 
     return {
@@ -192,7 +237,9 @@ def close_round_node(state: AgentState) -> dict:
         "counter": state["counter"] + 1,
         "accepted": False,
         "generated_test": "",
+        "candidate_test": "",
         "reviewed_test": "",
+        "raw_review_response": "",
         "review_feedback": "",
         "review_time_seconds": 0.0,
         "candidate_execution_time_seconds": 0.0,
@@ -201,10 +248,31 @@ def close_round_node(state: AgentState) -> dict:
         "generation_time_seconds": 0.0,
         "generator_finish_reason": None,
         "generator_usage": None,
+        "review_finish_reason": None,
+        "review_usage": None,
+        "reviewer_called": False,
+        "repair_changed": False,
+        "repair_duplicate": False,
+        "generator_evaluation": None,
+        "repair_evaluation": None,
     }
 
 def record_round_node(state: AgentState) -> dict:
     """Store the complete result of the current generation round."""
+
+    generator_evaluation = state.get("generator_evaluation") or {}
+    repair_evaluation = state.get("repair_evaluation")
+
+    generator_execution_time = float(
+        generator_evaluation.get("execution_time_seconds") or 0.0
+    )
+    repair_execution_time = float(
+        (repair_evaluation or {}).get("execution_time_seconds") or 0.0
+    )
+    total_round_execution_time = round(
+        generator_execution_time + repair_execution_time,
+        4,
+    )
 
     round_result = {
         "k": state["counter"],
@@ -216,21 +284,40 @@ def record_round_node(state: AgentState) -> dict:
         "generator_finish_reason": state["generator_finish_reason"],
         "generator_usage": state["generator_usage"],
 
-        # Final candidate returned by the reviewer.
-        #
-        # `generated_test` intentionally contains the reviewed version
-        # because the mutation evaluator expects this field to contain
-        # the candidate that was actually executed.
-        "generated_test": state["reviewed_test"],
-        "reviewed_test": state["reviewed_test"],
+        # Final candidate executed by pytest. `generated_test` keeps this
+        # value because the mutation evaluator consumes that field.
+        "generated_test": state["candidate_test"],
+        "final_test": state["candidate_test"],
+        "reviewed_test": (
+            state["reviewed_test"]
+            if state["reviewer_called"]
+            else None
+        ),
 
         # Reviewer information.
+        "reviewer_called": state["reviewer_called"],
+        "repair_changed": state["repair_changed"],
+        "repair_duplicate": state["repair_duplicate"],
+        "repair_evaluated": repair_evaluation is not None,
         "raw_review_response": state["raw_review_response"],
         "review_feedback": state["review_feedback"],
         "review_finish_reason": state[
             "review_finish_reason"
         ],
         "review_usage": state["review_usage"],
+
+        # Separate traces for the generator candidate and optional repair.
+        "generator_evaluation": generator_evaluation,
+        "repair_evaluation": repair_evaluation,
+        "generator_candidate_passed": bool(
+            generator_evaluation.get("test_passed", False)
+        ),
+        "generator_syntax_valid": bool(
+            generator_evaluation.get("syntax_valid", False)
+        ),
+        "generator_format_valid": bool(
+            generator_evaluation.get("format_valid", False)
+        ),
 
         # Structural validation.
         "test_function_name": state["test_function_name"],
@@ -249,6 +336,7 @@ def record_round_node(state: AgentState) -> dict:
         #"candidate_execution_time_seconds": state["execution_time_seconds"],
         "candidate_stdout": state["candidate_stdout"],
         "candidate_stderr": state["candidate_stderr"],
+        "execution_feedback": state["execution_feedback"],
 
         # State of the accumulated suite after this round.
         "accepted_tests": len(state["accepted_tests"]),
@@ -274,9 +362,7 @@ def record_round_node(state: AgentState) -> dict:
         "fallback_suite_execution_time_seconds": state[
             "fallback_suite_execution_time_seconds"
         ],
-        "execution_time_seconds": state[
-            "execution_time_seconds"
-        ],
+        "execution_time_seconds": total_round_execution_time,
     }
 
     updated_rounds = [
@@ -296,11 +382,30 @@ def record_round_node(state: AgentState) -> dict:
 
 def route_after_evaluation(
     state: AgentState,
-) -> Literal["add_to_suite", "close_round"]:
-    """Decide whether the candidate should be added to the suite."""
+) -> Literal["add_to_suite", "review", "close_round"]:
+    """Accept, request one repair, or close the current round."""
 
     if state["accepted"]:
         return "add_to_suite"
+
+    # A timeout is not sent to the LLM: it does not provide a reliable
+    # correctness signal and retrying can double an already expensive round.
+    if state["timed_out"]:
+        return "close_round"
+
+    if not state["reviewer_called"]:
+        return "review"
+
+    return "close_round"
+
+
+def route_after_review(
+    state: AgentState,
+) -> Literal["evaluate_repair", "close_round"]:
+    """Evaluate only a genuinely changed repair candidate."""
+
+    if state["repair_changed"]:
+        return "evaluate_repair"
 
     return "close_round"
 
@@ -336,8 +441,38 @@ def save_results_node(state: AgentState) -> dict:
         1
         for round_result in rounds
         if (
-            round_result["syntax_valid"]
-            and round_result["format_valid"]
+            round_result["generator_syntax_valid"]
+            and round_result["generator_format_valid"]
+        )
+    )
+
+    direct_generator_passes = sum(
+        1
+        for round_result in rounds
+        if round_result["generator_candidate_passed"]
+    )
+
+    reviewer_calls = sum(
+        1
+        for round_result in rounds
+        if round_result["reviewer_called"]
+    )
+
+    evaluated_repairs = sum(
+        1
+        for round_result in rounds
+        if round_result["repair_evaluated"]
+    )
+
+    successful_repairs = sum(
+        1
+        for round_result in rounds
+        if (
+            isinstance(round_result.get("repair_evaluation"), dict)
+            and round_result["repair_evaluation"].get(
+                "test_passed",
+                False,
+            )
         )
     )
 
@@ -405,7 +540,11 @@ def save_results_node(state: AgentState) -> dict:
         "task_id": state["task_id"],
         "function_name": state["function_name"],
         "model_id": state["model_id"],
-        "system": "multiagent_generator_reviewer",
+        "system": "multiagent_generator_conditional_reviewer",
+        "dataset_path": state["dataset_path"],
+        "cyclomatic_complexity": state[
+            "cyclomatic_complexity"
+        ],
         "max_k": max_k,
         "evaluation_status": "completed",
 
@@ -462,7 +601,10 @@ def save_results_node(state: AgentState) -> dict:
 
         # Generation and acceptance.
         "generated_tests": len(rounds),
-        "reviewed_tests": len(rounds),
+        "reviewed_tests": reviewer_calls,
+        "reviewer_calls": reviewer_calls,
+        "evaluated_repairs": evaluated_repairs,
+        "successful_repairs": successful_repairs,
         "accepted_tests": accepted_candidates,
         "valid_generation_rate": round(
             valid_generations / max_k,
@@ -472,6 +614,18 @@ def save_results_node(state: AgentState) -> dict:
             passed_candidates / max_k,
             4,
         ) if max_k else 0.0,
+        "direct_generator_pass_rate": round(
+            direct_generator_passes / max_k,
+            4,
+        ) if max_k else 0.0,
+        "repair_success_rate": round(
+            successful_repairs / reviewer_calls,
+            4,
+        ) if reviewer_calls else 0.0,
+        "evaluated_repair_success_rate": round(
+            successful_repairs / evaluated_repairs,
+            4,
+        ) if evaluated_repairs else 0.0,
 
         # Coverage.
         "coverage_improving_tests": (
@@ -556,6 +710,24 @@ def sum_usage_tokens(rounds: List[Dict],usage_field: str,token_field: str,) -> i
             )
 
     return total
+
+def load_task_by_id(dataset_path: Path,task_id: str,) -> ULTTask:
+    """Load one ULT task by its string identifier."""
+
+    if not dataset_path.is_file():
+        raise FileNotFoundError(
+            f"Dataset not found: {dataset_path}"
+        )
+
+    tasks = load_ult(dataset_path)
+
+    for task in tasks:
+        if str(task.task_id) == str(task_id):
+            return task
+
+    raise ValueError(
+        f"Task {task_id} was not found in {dataset_path}."
+    )
 #--------------
 
 graph = StateGraph(AgentState)
@@ -571,15 +743,23 @@ graph.add_node("save_results",save_results_node)
 
 
 graph.add_edge(START, "generator")
-graph.add_edge( "generator","reviewer")
-graph.add_edge( "reviewer","evaluator")
+graph.add_edge("generator", "evaluator")
 graph.add_conditional_edges(
     "evaluator",
     route_after_evaluation,
     {
         "add_to_suite": "suite_adder",
+        "review": "reviewer",
         "close_round": "record_round",
     }
+)
+graph.add_conditional_edges(
+    "reviewer",
+    route_after_review,
+    {
+        "evaluate_repair": "evaluator",
+        "close_round": "record_round",
+    },
 )
 graph.add_edge( "suite_adder","record_round")
 graph.add_edge( "record_round","close_round")
@@ -600,63 +780,180 @@ graph.add_edge(
 app = graph.compile()
 
 
-initial_state: AgentState = {
-    "model_id": model_id,
-    "task_id": "smoke_is_even",
-    "review_time_seconds": 0.0,
-    "candidate_execution_time_seconds": 0.0,
-    "fallback_suite_execution_time_seconds": 0.0,
-    "execution_time_seconds": 0.0,
-    "function_name": "is_even",
-    "solution_code": """
-def is_even(number: int) -> bool:
-    return number % 2 == 0
-""",
-    "output_dir": str(OUTPUT_DIR),
-    "timeout_seconds": 30,
+def build_initial_state(
+    task: ULTTask,
+    model_id: str,
+    dataset_path: Path,
+    output_dir: Path,
+    max_k: int = 5,
+    timeout_seconds: int = 30,
+) -> AgentState:
+    """Create an independent graph state for one ULT task."""
 
-    "counter": 1,
-    "max_rounds": 5,
+    return {
+        # Task and model.
+        "model_id": model_id,
+        "task_id": str(task.task_id),
+        "function_name": task.func_name,
+        "solution_code": task.code,
+        "description": task.description,
+        "cyclomatic_complexity": task.cyclomatic_complexity,
+        "dataset_path": str(dataset_path.resolve()),
 
-    "generated_test": "",
-    "generation_time_seconds": 0.0,
-    "generator_finish_reason": None,
-    "generator_usage": None,
-    "reviewed_test": "",
-    "raw_review_response": "",
-    "review_feedback": "",
-    "review_finish_reason": None,
-    "review_usage": None,
+        # Execution.
+        "output_dir": str(output_dir.resolve()),
+        "timeout_seconds": timeout_seconds,
 
-    "accepted": False,
-    "accepted_tests": [],
+        # Graph control.
+        "counter": 1,
+        "max_rounds": max_k,
 
-    "syntax_valid": False,
-    "format_valid": False,
-    "format_errors": [],
-    "duplicate_name": False,
-    "test_function_name": None,
+        # Generator.
+        "generated_test": "",
+        "candidate_test": "",
+        "generation_time_seconds": 0.0,
+        "generator_finish_reason": None,
+        "generator_usage": None,
 
-    "pytest_exit_code": None,
-    "test_passed": False,
-    "timed_out": False,
-    "execution_feedback": "",
-    "candidate_stdout": "",
-    "candidate_stderr": "",
+        # Reviewer.
+        "reviewed_test": "",
+        "raw_review_response": "",
+        "review_feedback": "",
+        "review_time_seconds": 0.0,
+        "review_finish_reason": None,
+        "review_usage": None,
+        "reviewer_called": False,
+        "repair_changed": False,
+        "repair_duplicate": False,
 
-    "suite_passed": False,
-    "line_coverage": None,
-    "branch_coverage": None,
-    "line_coverage_gain": 0.0,
-    "branch_coverage_gain": 0.0,
-    "improved_coverage": False,
+        # Stage-specific deterministic evaluations.
+        "generator_evaluation": None,
+        "repair_evaluation": None,
 
-    "rounds": [],
-}
+        # Acceptance.
+        "accepted": False,
+        "accepted_tests": [],
 
-final_state = app.invoke(initial_state)
+        # Validation.
+        "syntax_valid": False,
+        "format_valid": False,
+        "format_errors": [],
+        "duplicate_name": False,
+        "test_function_name": None,
 
-print("\nAccepted tests:")
-for test in final_state["accepted_tests"]:
-    print(test)
-    print("-" * 50)
+        # Execution result.
+        "pytest_exit_code": None,
+        "test_passed": False,
+        "timed_out": False,
+        "candidate_execution_time_seconds": 0.0,
+        "fallback_suite_execution_time_seconds": 0.0,
+        "execution_time_seconds": 0.0,
+        "execution_feedback": "",
+        "candidate_stdout": "",
+        "candidate_stderr": "",
+
+        # Accumulated suite.
+        "suite_passed": False,
+        "line_coverage": None,
+        "branch_coverage": None,
+        "line_coverage_gain": 0.0,
+        "branch_coverage_gain": 0.0,
+        "improved_coverage": False,
+
+        # Full trace.
+        "rounds": [],
+    }
+
+
+def evaluate_multiagent_task(
+    task: ULTTask,
+    model_id: str,
+    dataset_path: Path,
+    output_dir: Path,
+    max_k: int = 5,
+    timeout_seconds: int = 30,
+) -> dict[str, Any]:
+    """Run the compiled multi-agent graph for one ULT task."""
+
+    initial_state = build_initial_state(
+        task=task,
+        model_id=model_id,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        max_k=max_k,
+        timeout_seconds=timeout_seconds,
+    )
+
+    app.invoke(initial_state)
+
+    result_path = output_dir / "result.json"
+
+    if not result_path.is_file():
+        raise RuntimeError(
+            f"The graph did not create its result file: {result_path}"
+        )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"Invalid graph result in: {result_path}"
+        )
+
+    return result
+
+
+def main() -> None:
+    """Preserve the original single-task smoke execution."""
+
+    smoke_task_id = "10"
+    smoke_output_dir = (
+        PROJECT_ROOT
+        / "runs"
+        / "ult"
+        / "multiagent"
+        / "smoke"
+        / f"task_{smoke_task_id}"
+    )
+
+    available_models = client.models.list().data
+
+    if not available_models:
+        raise RuntimeError("LM Studio is running, but no model is loaded.")
+
+    model_id = os.getenv(
+        "LM_STUDIO_MODEL",
+        available_models[0].id,
+    )
+
+    task = load_task_by_id(
+        dataset_path=DATASET_PATH,
+        task_id=smoke_task_id,
+    )
+
+    print(f"Model: {model_id}")
+    print(f"Task: {task.task_id} - {task.func_name}")
+    print(
+        "Cyclomatic complexity: "
+        f"{task.cyclomatic_complexity}"
+    )
+    print(f"Dataset: {DATASET_PATH}")
+    print(f"Output: {smoke_output_dir}")
+
+    final_state = app.invoke(
+        build_initial_state(
+            task=task,
+            model_id=model_id,
+            dataset_path=DATASET_PATH,
+            output_dir=smoke_output_dir,
+        )
+    )
+
+    print("\nAccepted tests:")
+    for test in final_state["accepted_tests"]:
+        print(test)
+        print("-" * 50)
+
+
+if __name__ == "__main__":
+    main()

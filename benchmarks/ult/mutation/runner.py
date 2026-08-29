@@ -156,8 +156,10 @@ def evaluate_result_record(
     cosmic_ray: str,
     timeout_seconds: float,
     work_dir: Path,
+    *,
+    final_only: bool = False,
 ) -> TaskMutationEvaluation:
-    """Evaluate every distinct cumulative suite for one ULT task."""
+    """Evaluate every cumulative suite, or only the final one, for one task."""
     work_dir.mkdir(parents=True, exist_ok=True)
     (work_dir / "solution.py").write_text(task.code, encoding="utf-8")
 
@@ -174,6 +176,7 @@ def evaluate_result_record(
         "function_name": task.function_name,
         "model_id": record.get("model_id"),
         "max_k": record.get("max_k", len(record.get("rounds") or [])),
+        "evaluation_mode": "final_only" if final_only else "all_k",
     }
     if record.get("evaluation_status") not in TERMINAL_INPUT_STATUSES:
         return TaskMutationEvaluation(
@@ -183,6 +186,11 @@ def evaluate_result_record(
         )
 
     snapshots = reconstruct_suites(record)
+    if final_only and snapshots:
+        # Each snapshot already contains the accumulated accepted suite at k.
+        # Therefore the last snapshot is the complete suite produced by the run.
+        snapshots = [snapshots[-1]]
+
     if not any(item["suite_code"] for item in snapshots):
         return TaskMutationEvaluation(
             {
@@ -297,14 +305,27 @@ def result_at_k(record: dict[str, Any], k: int) -> dict[str, Any] | None:
 
 def build_mutation_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate strict task scores into macro and pooled Mut@k metrics."""
+    modes = {str(item.get("evaluation_mode", "all_k")) for item in records}
+    if len(modes) > 1:
+        raise ValueError(
+            "Cannot summarize mutation records produced in different "
+            f"evaluation modes: {sorted(modes)}"
+        )
+    evaluation_mode = next(iter(modes), "all_k")
+
     included = [
         item
         for item in records
         if item.get("evaluation_status") in {"completed", "no_accepted_tests"}
     ]
     max_k = max((int(item.get("max_k") or 0) for item in included), default=0)
+    evaluated_ks = (
+        [max_k]
+        if evaluation_mode == "final_only" and max_k
+        else range(1, max_k + 1)
+    )
     by_k: list[dict[str, Any]] = []
-    for k in range(1, max_k + 1):
+    for k in evaluated_ks:
         rows = [result_at_k(record, k) for record in included]
         measured = [
             row
@@ -342,6 +363,7 @@ def build_mutation_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {
         "records": len(records),
         "n_functions": len(included),
+        "evaluation_mode": evaluation_mode,
         "status_counts": dict(
             Counter(str(item.get("evaluation_status")) for item in records)
         ),
@@ -392,6 +414,7 @@ def run_mutation_evaluation(
     cosmic_ray_command: str | None = None,
     keep_workdirs: bool = False,
     resume: bool = False,
+    final_only: bool = False,
 ) -> tuple[Path, Path, Path, Path]:
     """Run mutation testing and return compact, catalog, detail and summary paths."""
     dataset = load_dataset(dataset_path.resolve())
@@ -422,6 +445,17 @@ def run_mutation_evaluation(
         if resume and mutation_results_path.exists()
         else []
     )
+    evaluation_mode = "final_only" if final_only else "all_k"
+    incompatible_modes = {
+        str(item.get("evaluation_mode", "all_k"))
+        for item in existing
+        if str(item.get("evaluation_mode", "all_k")) != evaluation_mode
+    }
+    if incompatible_modes:
+        raise ValueError(
+            "The existing mutation results use a different evaluation mode "
+            f"({sorted(incompatible_modes)}). Use a new output directory."
+        )
     completed_ids = {str(item.get("task_id")) for item in existing}
     if resume and any(
         "mutants" in round_result
@@ -469,6 +503,7 @@ def run_mutation_evaluation(
             result = {
                 "task_id": task_id,
                 "model_id": record.get("model_id"),
+                "evaluation_mode": evaluation_mode,
                 "evaluation_status": "missing_dataset_task",
                 "by_k": [],
             }
@@ -483,6 +518,7 @@ def run_mutation_evaluation(
                         cosmic_ray,
                         timeout_seconds,
                         output_dir / "work" / f"task_{task_id}",
+                        final_only=final_only,
                     )
                 else:
                     with tempfile.TemporaryDirectory(
@@ -494,6 +530,7 @@ def run_mutation_evaluation(
                             cosmic_ray,
                             timeout_seconds,
                             Path(temporary_directory),
+                            final_only=final_only,
                         )
             except Exception as error:
                 result = {
@@ -504,6 +541,7 @@ def run_mutation_evaluation(
                         "max_k",
                         len(record.get("rounds") or []),
                     ),
+                    "evaluation_mode": evaluation_mode,
                     "evaluation_status": "mutation_infrastructure_error",
                     "error_type": type(error).__name__,
                     "error_message": truncate_diagnostic(error),
